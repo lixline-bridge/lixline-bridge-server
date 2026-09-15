@@ -37,6 +37,13 @@ async function getCatalog() {
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// Приёмник событий от MAX (нужен, только если захотите личные уведомления
+// о заявках — см. README, раздел "Личные уведомления")
+app.post('/webhook', (req, res) => {
+  console.log('MAX update:', JSON.stringify(req.body));
+  res.json({ ok: true });
+});
+
 app.get('/api/categories', async (req, res) => {
   try {
     const { categories } = await getCatalog();
@@ -71,8 +78,32 @@ app.get('/api/products/:id', async (req, res) => {
 });
 
 // Приём заявок из мини-приложения (кнопка "Оформить заявку")
+const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN;
+
+// Отправляет сообщение конкретному пользователю MAX от имени бота.
+// Официальный метод: https://dev.max.ru/docs-api/methods/POST/messages
+async function sendMaxMessage(userId, text) {
+  if (!MAX_BOT_TOKEN || !userId) return;
+  const url = `https://platform-api2.max.ru/messages?user_id=${encodeURIComponent(userId)}`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: MAX_BOT_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) {
+      console.warn('MAX API вернул ошибку при отправке сообщения:', res.status, await res.text());
+    }
+  } catch (e) {
+    console.warn('Не удалось отправить сообщение через MAX API:', e.message);
+  }
+}
+
 app.post('/api/order', async (req, res) => {
-  const { name, phone, comment, items } = req.body || {};
+  const { name, phone, comment, items, max_user_id } = req.body || {};
   if (!name || !phone) {
     return res.status(400).json({ error: 'Укажите имя и телефон' });
   }
@@ -82,13 +113,30 @@ app.post('/api/order', async (req, res) => {
     phone,
     comment,
     items,
+    max_user_id,
     at: new Date().toISOString(),
   });
 
-  // TODO: когда в кабинете MAX для партнёров будет получен токен бота —
-  // отправлять сюда уведомление о заявке, например через
-  // POST https://platform-api.max.ru/messages с заголовком
-  // Authorization: <MAX_BOT_TOKEN>. Аналогично можно продублировать в Telegram.
+  const itemsText = (items || [])
+    .map((i) => `«${i.name}» — ${new Intl.NumberFormat('ru-RU').format(i.price)} ₽`)
+    .join(', ');
+
+  // Подтверждение клиенту — придёт прямо в его чат с ботом «Ликс-Лайн»
+  if (max_user_id) {
+    await sendMaxMessage(
+      max_user_id,
+      `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nСкоро свяжемся с вами по номеру ${phone}${comment ? `\nВаш комментарий: ${comment}` : ''}\n\nМожете написать здесь, если хотите что-то уточнить уже сейчас.`
+    );
+  }
+
+  // Уведомление вам самим — заполните MAX_NOTIFY_USER_ID в .env своим ID
+  // (как его получить — см. README), чтобы новые заявки сразу приходили вам
+  if (process.env.MAX_NOTIFY_USER_ID) {
+    await sendMaxMessage(
+      process.env.MAX_NOTIFY_USER_ID,
+      `🔔 Новая заявка с сайта!\n${name}, ${phone}\n${itemsText}${comment ? `\nКомментарий: ${comment}` : ''}`
+    );
+  }
 
   res.json({ ok: true });
 });
