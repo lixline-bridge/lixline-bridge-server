@@ -26,7 +26,7 @@ async function getCatalog() {
   if (isFresh) return cache.data;
 
   if (!FEED_URL || !FEED_TOKEN) {
-    throw new Error('FEED_URL или FEED_TOKEN не заданы в .env');
+    throw new Error('FEED_URL или FEED_TOKEN не заданы in .env');
   }
 
   const url = `${FEED_URL}?token=${encodeURIComponent(FEED_TOKEN)}`;
@@ -40,7 +40,6 @@ async function getCatalog() {
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// Приёмник событий от MAX
 app.post('/webhook', (req, res) => {
   console.log('MAX update:', JSON.stringify(req.body));
   res.json({ ok: true });
@@ -79,13 +78,12 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-// Приём заявок из mini-приложения (кнопка "Оформить заявку")
 const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN;
 
-// Отправляет сообщение конкретному пользователю MAX от имени бота.
-async function sendMaxMessage(userId, text) {
-  if (!MAX_BOT_TOKEN || !userId) return;
-  const url = `https://max.ru{encodeURIComponent(userId)}`;
+// Универсальная функция отправки сообщений в МАКС
+async function sendMaxMessage(targetParam, targetId, text) {
+  if (!MAX_BOT_TOKEN || !targetId) return;
+  const url = `https://max.ru{targetParam}=${encodeURIComponent(targetId)}`;
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -96,31 +94,12 @@ async function sendMaxMessage(userId, text) {
       body: JSON.stringify({ text }),
     });
     if (!res.ok) {
-      console.warn('MAX API вернул ошибку при отправке сообщения пользователю:', res.status, await res.text());
+      console.warn(`MAX API ошибка (${targetParam}=${targetId}):`, res.status, await res.text());
+    } else {
+      console.log(`Сообщение успешно отправлено в ${targetParam}=${targetId}`);
     }
   } catch (e) {
-    console.warn('Не удалось отправить сообщение через MAX API:', e.message);
-  }
-}
-
-// Отправляет сообщение в общую ГРУППУ МАКС от имени бота.
-async function sendMaxGroupMessage(chatId, text) {
-  if (!MAX_BOT_TOKEN || !chatId) return;
-  const url = `https://max.ru{encodeURIComponent(chatId)}`;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: MAX_BOT_TOKEN,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ text }),
-    });
-    if (!res.ok) {
-      console.warn('MAX API вернул ошибку при отправке сообщения в группу:', res.status, await res.text());
-    }
-  } catch (e) {
-    console.warn('Не удалось отправить сообщение в группу МАКС API:', e.message);
+    console.warn(`Исключение при отправке через MAX API:`, e.message);
   }
 }
 
@@ -130,45 +109,34 @@ app.post('/api/order', async (req, res) => {
     return res.status(400).json({ error: 'Укажите имя и телефон' });
   }
 
-  console.log('Новая заявка:', {
-    name,
-    phone,
-    comment,
-    items,
-    max_user_id,
-    at: new Date().toISOString(),
-  });
+  console.log('Новая заявка:', { name, phone, comment, items, max_user_id });
 
   const itemsText = (items || [])
-    .map((i) => `«${i.name}» — ${new Intl.NumberFormat('ru-RU').format(i.price)} ₽`)
+    .map((i) => `«${i.name}» — ${i.price} руб.`)
     .join(', ');
 
-  const commentText = comment ? `\nВаш комментарий: ${comment}` : '';
-  const commentGroupText = comment ? `\n💬 **Комментарий:** ${comment}` : '';
+  const commentText = comment ? `\nКомментарий: ${comment}` : '';
 
-  // 1. Подтверждение клиенту в личку
+  // Текст сообщения без спецсимволов разметки
+  const clientText = `Добрый день, ${name}! Заявка принята.\nТовар: ${itemsText}\nТелефон: ${phone}${commentText}`;
+  const groupText = `🔔 Новая заявка из МАКС-Магазина!\n\nКлиент: ${name}\nТелефон: ${phone}\nТовар: ${itemsText}${commentText}`;
+
+  // 1. Отправка клиенту
   if (max_user_id) {
-    await sendMaxMessage(
-      max_user_id,
-      `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nСкоро свяжемся с вами по номеру ${phone}${commentText}\n\nМожете написать здесь, если хотите что-то уточнить уже сейчас.`
-    );
+    await sendMaxMessage('user_id', max_user_id, clientText);
   }
 
-  // 2. Уведомление менеджерам в общую группу «Заявки из МАКС-Магазина»
-  const groupNotificationText = `🔔 **Новая заявка из МАКС-Магазина!**\n\n👤 **Клиент:** ${name}\n📞 **Телефон:** ${phone}\n📦 **Товар:** ${itemsText}${commentGroupText}`;
-  await sendMaxGroupMessage(MANAGERS_GROUP_ID, groupNotificationText);
+  // 2. Отправка менеджерам в группу
+  await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, groupText);
 
-  // 3. Дополнительное личное уведомление админу (если заполнено в .env)
+  // 3. Отправка админу (если задан)
   if (process.env.MAX_NOTIFY_USER_ID) {
-    await sendMaxMessage(
-      process.env.MAX_NOTIFY_USER_ID,
-      `🔔 Новая заявка с сайта!\n${name}, ${phone}\n${itemsText}${commentText}`
-    );
+    await sendMaxMessage('user_id', process.env.MAX_NOTIFY_USER_ID, groupText);
   }
 
   res.json({ ok: true });
 });
 
 app.listen(PORT, () => {
-  console.log(`Мост Ликс-Лайн запущен: http://localhost:${PORT}`);
+  console.log(`Мост Ликс-Лайн запущен на порту: ${PORT}`);
 });
