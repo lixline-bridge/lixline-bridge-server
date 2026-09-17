@@ -1,7 +1,7 @@
 // Мост между сайтом lixcompany.ru (OpenCart) и мини-приложениями в MAX/Telegram.
 // Забирает каталог с фида на сайте, кэширует его в памяти и отдаёт
 // в чистом виде мини-приложению. Также принимает заявки на заказ.
-
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
