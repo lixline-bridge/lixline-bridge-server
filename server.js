@@ -17,7 +17,7 @@ const FEED_TOKEN = process.env.FEED_TOKEN;
 const CACHE_TTL = (Number(process.env.CACHE_TTL_SECONDS) || 300) * 1000;
 
 // ID вашей группы в МАКС для менеджеров
-const MANAGERS_GROUP_ID = "-79068581102977";
+const MANAGERS_GROUP_ID = -79068581102977;
 
 let cache = { data: null, fetchedAt: 0 };
 
@@ -26,7 +26,7 @@ async function getCatalog() {
   if (isFresh) return cache.data;
 
   if (!FEED_URL || !FEED_TOKEN) {
-    throw new Error('FEED_URL или FEED_TOKEN не заданы in .env');
+    throw new Error('FEED_URL или FEED_TOKEN не заданы в .env');
   }
 
   const url = `${FEED_URL}?token=${encodeURIComponent(FEED_TOKEN)}`;
@@ -80,26 +80,40 @@ app.get('/api/products/:id', async (req, res) => {
 
 const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN;
 
-// Универсальная функция отправки сообщений в МАКС
-async function sendMaxMessage(targetParam, targetId, text) {
+// Исправленная функция отправки сообщений в МАКС API
+async function sendMaxMessage(targetType, targetId, textContent) {
   if (!MAX_BOT_TOKEN || !targetId) return;
-  const url = `https://max.ru{targetParam}=${encodeURIComponent(targetId)}`;
+
+  // Формируем корректный URL и Body в зависимости от того, шлем пользователю или в чат/группу
+  const url = `https://max.ru`;
+  
+  const requestBody = {
+    text: textContent
+  };
+
+  if (targetType === 'chat_id') {
+    requestBody.chat_id = Number(targetId);
+  } else {
+    requestBody.user_id = Number(targetId);
+  }
+
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: {
-        Authorization: MAX_BOT_TOKEN,
+        'Authorization': MAX_BOT_TOKEN,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(requestBody),
     });
+    
     if (!res.ok) {
-      console.warn(`MAX API ошибка (${targetParam}=${targetId}):`, res.status, await res.text());
+      console.warn(`MAX API ошибка отправки (${targetType}=${targetId}):`, res.status, await res.text());
     } else {
-      console.log(`Сообщение успешно отправлено в ${targetParam}=${targetId}`);
+      console.log(`Сообщение успешно отправлено в ${targetType}=${targetId}`);
     }
   } catch (e) {
-    console.warn(`Исключение при отправке через MAX API:`, e.message);
+    console.warn(`Исключение при работе с MAX API:`, e.message);
   }
 }
 
@@ -109,7 +123,7 @@ app.post('/api/order', async (req, res) => {
     return res.status(400).json({ error: 'Укажите имя и телефон' });
   }
 
-  console.log('Новая заявка:', { name, phone, comment, items, max_user_id });
+  console.log('Обработка новой заявки:', { name, phone, comment, items, max_user_id });
 
   const itemsText = (items || [])
     .map((i) => `«${i.name}» — ${i.price} руб.`)
@@ -117,19 +131,19 @@ app.post('/api/order', async (req, res) => {
 
   const commentText = comment ? `\nКомментарий: ${comment}` : '';
 
-  // Текст сообщения без спецсимволов разметки
-  const clientText = `Добрый день, ${name}! Заявка принята.\nТовар: ${itemsText}\nТелефон: ${phone}${commentText}`;
-  const groupText = `🔔 Новая заявка из МАКС-Магазина!\n\nКлиент: ${name}\nТелефон: ${phone}\nТовар: ${itemsText}${commentText}`;
+  // Тексты без лишнего markdown-форматирования во избежание конфликтов парсера мессенджера
+  const clientText = `Добрый день, ${name}! Ваша заявка принята.\nТовар: ${itemsText}\nТелефон: ${phone}${commentText}`;
+  const groupText = `🔔 Новая заявка из МАКС-Магазина!\nКлиент: ${name}\nТелефон: ${phone}\nТовар: ${itemsText}${commentText}`;
 
-  // 1. Отправка клиенту
+  // 1. Отправка клиенту в личку
   if (max_user_id) {
     await sendMaxMessage('user_id', max_user_id, clientText);
   }
 
-  // 2. Отправка менеджерам в группу
+  // 2. Отправка менеджерам в общую группу
   await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, groupText);
 
-  // 3. Отправка админу (если задан)
+  // 3. Отправка админу лично (если настроено в Render Environment)
   if (process.env.MAX_NOTIFY_USER_ID) {
     await sendMaxMessage('user_id', process.env.MAX_NOTIFY_USER_ID, groupText);
   }
@@ -138,5 +152,5 @@ app.post('/api/order', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Мост Ликс-Лайн запущен на порту: ${PORT}`);
+  console.log(`Мост Ликс-Лайн успешно запущен на порту: ${PORT}`);
 });
