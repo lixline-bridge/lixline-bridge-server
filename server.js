@@ -17,7 +17,7 @@ const FEED_TOKEN = process.env.FEED_TOKEN;
 const CACHE_TTL = (Number(process.env.CACHE_TTL_SECONDS) || 300) * 1000;
 
 // ID вашей группы в МАКС для менеджеров
-const MANAGERS_GROUP_ID = -79068581102977;
+const MANAGERS_GROUP_ID = "-79068581102977";
 
 let cache = { data: null, fetchedAt: 0 };
 
@@ -80,22 +80,12 @@ app.get('/api/products/:id', async (req, res) => {
 
 const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN;
 
-// Исправленная функция отправки сообщений в МАКС API
-async function sendMaxMessage(targetType, targetId, textContent) {
+// Функция отправки сообщений строго по документации curl МАКС API
+async function sendMaxMessage(targetParam, targetId, textContent) {
   if (!MAX_BOT_TOKEN || !targetId) return;
 
-  // Формируем корректный URL и Body в зависимости от того, шлем пользователю или в чат/группу
-  const url = `https://max.ru`;
-  
-  const requestBody = {
-    text: textContent
-  };
-
-  if (targetType === 'chat_id') {
-    requestBody.chat_id = Number(targetId);
-  } else {
-    requestBody.user_id = Number(targetId);
-  }
+  // Параметр получателя (user_id или chat_id) передаем строго в URL query-параметром
+  const url = `https://max.ru{targetParam}=${encodeURIComponent(targetId)}`;
 
   try {
     const res = await fetch(url, {
@@ -104,16 +94,18 @@ async function sendMaxMessage(targetType, targetId, textContent) {
         'Authorization': MAX_BOT_TOKEN,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(requestBody),
+      body: JSON.stringify({
+        text: textContent
+      }),
     });
     
     if (!res.ok) {
-      console.warn(`MAX API ошибка отправки (${targetType}=${targetId}):`, res.status, await res.text());
+      console.warn(`MAX API ошибка отправки (${targetParam}=${targetId}):`, res.status, await res.text());
     } else {
-      console.log(`Сообщение успешно отправлено в ${targetType}=${targetId}`);
+      console.log(`Сообщение успешно ушло в чат ${targetParam}=${targetId}`);
     }
   } catch (e) {
-    console.warn(`Исключение при работе с MAX API:`, e.message);
+    console.warn(`Исключение при работе с МАКС API:`, e.message);
   }
 }
 
@@ -131,11 +123,11 @@ app.post('/api/order', async (req, res) => {
 
   const commentText = comment ? `\nКомментарий: ${comment}` : '';
 
-  // Тексты без лишнего markdown-форматирования во избежание конфликтов парсера мессенджера
+  // Чистый плоский текст без потенциально опасных спецсимволов и markdown разметки
   const clientText = `Добрый день, ${name}! Ваша заявка принята.\nТовар: ${itemsText}\nТелефон: ${phone}${commentText}`;
   const groupText = `🔔 Новая заявка из МАКС-Магазина!\nКлиент: ${name}\nТелефон: ${phone}\nТовар: ${itemsText}${commentText}`;
 
-  // 1. Отправка клиенту в личку
+  // 1. Отправка клиенту в личный чат с ботом
   if (max_user_id) {
     await sendMaxMessage('user_id', max_user_id, clientText);
   }
@@ -143,7 +135,7 @@ app.post('/api/order', async (req, res) => {
   // 2. Отправка менеджерам в общую группу
   await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, groupText);
 
-  // 3. Отправка админу лично (если настроено в Render Environment)
+  // 3. Отправка админу лично (если заполнено в Render)
   if (process.env.MAX_NOTIFY_USER_ID) {
     await sendMaxMessage('user_id', process.env.MAX_NOTIFY_USER_ID, groupText);
   }
