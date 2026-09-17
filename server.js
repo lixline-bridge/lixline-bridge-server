@@ -1,6 +1,4 @@
 // Мост между сайтом lixcompany.ru (OpenCart) и мини-приложениями в MAX/Telegram.
-// Забирает каталог с фида на сайте, кэширует его в памяти и отдаёт
-// в чистом виде мини-приложению. Также принимает заявки на заказ.
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 require('dotenv').config();
 const express = require('express');
@@ -78,40 +76,53 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN;
+// Забираем токен и очищаем его от возможных случайных пробелов
+const rawToken = process.env.MAX_BOT_TOKEN || '';
+const MAX_BOT_TOKEN = rawToken.trim();
 
-// Дублируем параметры и в URL, и в Body для максимальной совместимости с прокси MAX
 async function sendMaxMessage(targetParam, targetId, textContent) {
   if (!MAX_BOT_TOKEN || !targetId) return;
 
-  // Формируем URL строго как в документации: /messages?user_id=... или ?chat_id=...
   const url = `https://max.ru{targetParam}=${encodeURIComponent(targetId)}`;
 
-  const bodyData = {
-    text: textContent
-  };
-
-  // На всякий случай дублируем в тело запроса числовой ID
-  if (targetParam === 'chat_id') {
-    bodyData.chat_id = Number(targetId);
-  } else if (targetParam === 'user_id') {
-    bodyData.user_id = Number(targetId);
-  }
+  // Пробуем стандартный заголовок. Если прокси требует "Bearer ", подставим его.
+  const authHeader = MAX_BOT_TOKEN.startsWith('Bearer ') ? MAX_BOT_TOKEN : `Bearer ${MAX_BOT_TOKEN}`;
 
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: {
-        'Authorization': MAX_BOT_TOKEN,
+        'Authorization': authHeader,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(bodyData)
+      body: JSON.stringify({
+        text: textContent
+      })
     });
     
     if (!res.ok) {
-      console.warn(`MAX API ошибка отправки (${targetParam}=${targetId}):`, res.status, await res.text());
+      const errText = await res.text();
+      console.warn(`MAX API ошибка отправки с Bearer (${targetParam}=${targetId}):`, res.status, errText);
+      
+      // Запасной вариант: если с Bearer не вышло, пробуем отправить токен чистым текстом
+      if (res.status === 400 || res.status === 401) {
+        console.log("Пробуем альтернативный формат авторизации без Bearer...");
+        const retryRes = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Authorization': MAX_BOT_TOKEN,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ text: textContent })
+        });
+        if (!retryRes.ok) {
+          console.warn(`Финальная ошибка без Bearer:`, retryRes.status, await retryRes.text());
+        } else {
+          console.log(`Успешно отправлено альтернативным методом в ${targetParam}=${targetId}`);
+        }
+      }
     } else {
-      console.log(`Сообщение успешно отправлено в ${targetParam}=${targetId}`);
+      console.log(`Сообщение успешно ушло в чат ${targetParam}=${targetId}`);
     }
   } catch (e) {
     console.warn(`Исключение при работе с МАКС API:`, e.message);
@@ -135,20 +146,22 @@ app.post('/api/order', async (req, res) => {
   const clientText = `Добрый день, ${name}! Ваша заявка принята.\nТовар: ${itemsText}\nТелефон: ${phone}${commentText}`;
   const groupText = `🔔 Новая заявка из МАКС-Магазина!\nКлиент: ${name}\nТелефон: ${phone}\nТовар: ${itemsText}${commentText}`;
 
-  // 1. Отправка клиенту в личку
   if (max_user_id) {
     await sendMaxMessage('user_id', max_user_id, clientText);
   }
 
-  // 2. Отправка менеджерам в группу
   await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, groupText);
 
-  // 3. Отправка админу (если задан)
   if (process.env.MAX_NOTIFY_USER_ID) {
     await sendMaxMessage('user_id', process.env.MAX_NOTIFY_USER_ID, groupText);
   }
 
   res.json({ ok: true });
+});
+
+app.use((err, req, res, next) => {
+  console.error("Глобальная ошибка сервера:", err.stack);
+  res.status(500).json({ error: "Внутренняя ошибка сервера" });
 });
 
 app.listen(PORT, () => {
