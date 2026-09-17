@@ -85,7 +85,7 @@ const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN;
 // Отправляет сообщение конкретному пользователю MAX от имени бота.
 async function sendMaxMessage(userId, text) {
   if (!MAX_BOT_TOKEN || !userId) return;
-  const url = `https://platform-api2.max.ru/messages?user_id=${encodeURIComponent(userId)}`;
+  const url = `https://max.ru{encodeURIComponent(userId)}`;
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -143,23 +143,26 @@ app.post('/api/order', async (req, res) => {
     .map((i) => `«${i.name}» — ${new Intl.NumberFormat('ru-RU').format(i.price)} ₽`)
     .join(', ');
 
+  const commentText = comment ? `\nВаш комментарий: ${comment}` : '';
+  const commentGroupText = comment ? `\n💬 **Комментарий:** ${comment}` : '';
+
   // 1. Подтверждение клиенту в личку
   if (max_user_id) {
     await sendMaxMessage(
       max_user_id,
-      `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nСкоро свяжемся с вами по номеру ${phone}${comment ? `\nВаш комментарий: \${comment}` : ''}\n\nМожете написать здесь, если хотите что-то уточнить уже сейчас.`
+      `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nСкоро свяжемся с вами по номеру ${phone}${commentText}\n\nМожете написать здесь, если хотите что-то уточнить уже сейчас.`
     );
   }
 
   // 2. Уведомление менеджерам в общую группу «Заявки из МАКС-Магазина»
-  const groupNotificationText = `🔔 **Новая заявка из МАКС-Магазина!**\n\n👤 **Клиент:** ${name}\n📞 **Телефон:** ${phone}\n📦 **Товар:** ${itemsText}${comment ? `\n💬 **Комментарий:** \${comment}` : ''}`;
+  const groupNotificationText = `🔔 **Новая заявка из МАКС-Магазина!**\n\n👤 **Клиент:** ${name}\n📞 **Телефон:** ${phone}\n📦 **Товар:** ${itemsText}${commentGroupText}`;
   await sendMaxGroupMessage(MANAGERS_GROUP_ID, groupNotificationText);
 
   // 3. Дополнительное личное уведомление админу (если заполнено в .env)
   if (process.env.MAX_NOTIFY_USER_ID) {
     await sendMaxMessage(
       process.env.MAX_NOTIFY_USER_ID,
-      `🔔 Новая заявка с сайта!\n${name}, ${phone}\n${itemsText}${comment ? `\nКомментарий: \${comment}` : ''}`
+      `🔔 Новая заявка с сайта!\n${name}, ${phone}\n${itemsText}${commentText}`
     );
   }
 
