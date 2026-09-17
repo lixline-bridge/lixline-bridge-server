@@ -16,6 +16,9 @@ const FEED_URL = process.env.FEED_URL;
 const FEED_TOKEN = process.env.FEED_TOKEN;
 const CACHE_TTL = (Number(process.env.CACHE_TTL_SECONDS) || 300) * 1000;
 
+// ID вашей группы в МАКС для менеджеров
+const MANAGERS_GROUP_ID = "-79068581102977";
+
 let cache = { data: null, fetchedAt: 0 };
 
 async function getCatalog() {
@@ -37,8 +40,7 @@ async function getCatalog() {
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// Приёмник событий от MAX (нужен, только если захотите личные уведомления
-// о заявках — см. README, раздел "Личные уведомления")
+// Приёмник событий от MAX
 app.post('/webhook', (req, res) => {
   console.log('MAX update:', JSON.stringify(req.body));
   res.json({ ok: true });
@@ -81,7 +83,6 @@ app.get('/api/products/:id', async (req, res) => {
 const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN;
 
 // Отправляет сообщение конкретному пользователю MAX от имени бота.
-// Официальный метод: https://dev.max.ru/docs-api/methods/POST/messages
 async function sendMaxMessage(userId, text) {
   if (!MAX_BOT_TOKEN || !userId) return;
   const url = `https://platform-api2.max.ru/messages?user_id=${encodeURIComponent(userId)}`;
@@ -95,10 +96,31 @@ async function sendMaxMessage(userId, text) {
       body: JSON.stringify({ text }),
     });
     if (!res.ok) {
-      console.warn('MAX API вернул ошибку при отправке сообщения:', res.status, await res.text());
+      console.warn('MAX API вернул ошибку при отправке сообщения пользователю:', res.status, await res.text());
     }
   } catch (e) {
     console.warn('Не удалось отправить сообщение через MAX API:', e.message);
+  }
+}
+
+// Отправляет сообщение в общую ГРУППУ МАКС от имени бота.
+async function sendMaxGroupMessage(chatId, text) {
+  if (!MAX_BOT_TOKEN || !chatId) return;
+  const url = `https://max.ru{encodeURIComponent(chatId)}`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: MAX_BOT_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) {
+      console.warn('MAX API вернул ошибку при отправке сообщения в группу:', res.status, await res.text());
+    }
+  } catch (e) {
+    console.warn('Не удалось отправить сообщение в группу МАКС API:', e.message);
   }
 }
 
@@ -121,20 +143,23 @@ app.post('/api/order', async (req, res) => {
     .map((i) => `«${i.name}» — ${new Intl.NumberFormat('ru-RU').format(i.price)} ₽`)
     .join(', ');
 
-  // Подтверждение клиенту — придёт прямо в его чат с ботом «Ликс-Лайн»
+  // 1. Подтверждение клиенту в личку
   if (max_user_id) {
     await sendMaxMessage(
       max_user_id,
-      `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nСкоро свяжемся с вами по номеру ${phone}${comment ? `\nВаш комментарий: ${comment}` : ''}\n\nМожете написать здесь, если хотите что-то уточнить уже сейчас.`
+      `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nСкоро свяжемся с вами по номеру ${phone}${comment ? `\nВаш комментарий: \${comment}` : ''}\n\nМожете написать здесь, если хотите что-то уточнить уже сейчас.`
     );
   }
 
-  // Уведомление вам самим — заполните MAX_NOTIFY_USER_ID в .env своим ID
-  // (как его получить — см. README), чтобы новые заявки сразу приходили вам
+  // 2. Уведомление менеджерам в общую группу «Заявки из МАКС-Магазина»
+  const groupNotificationText = `🔔 **Новая заявка из МАКС-Магазина!**\n\n👤 **Клиент:** ${name}\n📞 **Телефон:** ${phone}\n📦 **Товар:** ${itemsText}${comment ? `\n💬 **Комментарий:** \${comment}` : ''}`;
+  await sendMaxGroupMessage(MANAGERS_GROUP_ID, groupNotificationText);
+
+  // 3. Дополнительное личное уведомление админу (если заполнено в .env)
   if (process.env.MAX_NOTIFY_USER_ID) {
     await sendMaxMessage(
       process.env.MAX_NOTIFY_USER_ID,
-      `🔔 Новая заявка с сайта!\n${name}, ${phone}\n${itemsText}${comment ? `\nКомментарий: ${comment}` : ''}`
+      `🔔 Новая заявка с сайта!\n${name}, ${phone}\n${itemsText}${comment ? `\nКомментарий: \${comment}` : ''}`
     );
   }
 
