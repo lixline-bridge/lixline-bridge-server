@@ -80,29 +80,38 @@ app.get('/api/products/:id', async (req, res) => {
 
 const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN;
 
-// Функция отправки сообщений строго по документации curl МАКС API
+// Дублируем параметры и в URL, и в Body для максимальной совместимости с прокси MAX
 async function sendMaxMessage(targetParam, targetId, textContent) {
   if (!MAX_BOT_TOKEN || !targetId) return;
 
-  // Параметр получателя (user_id или chat_id) передаем строго в URL query-параметром
+  // Формируем URL строго как в документации: /messages?user_id=... или ?chat_id=...
   const url = `https://max.ru{targetParam}=${encodeURIComponent(targetId)}`;
+
+  const bodyData = {
+    text: textContent
+  };
+
+  // На всякий случай дублируем в тело запроса числовой ID
+  if (targetParam === 'chat_id') {
+    bodyData.chat_id = Number(targetId);
+  } else if (targetParam === 'user_id') {
+    bodyData.user_id = Number(targetId);
+  }
 
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Authorization': MAX_BOT_TOKEN,
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        text: textContent
-      }),
+      body: JSON.stringify(bodyData)
     });
     
     if (!res.ok) {
       console.warn(`MAX API ошибка отправки (${targetParam}=${targetId}):`, res.status, await res.text());
     } else {
-      console.log(`Сообщение успешно ушло в чат ${targetParam}=${targetId}`);
+      console.log(`Сообщение успешно отправлено в ${targetParam}=${targetId}`);
     }
   } catch (e) {
     console.warn(`Исключение при работе с МАКС API:`, e.message);
@@ -123,19 +132,18 @@ app.post('/api/order', async (req, res) => {
 
   const commentText = comment ? `\nКомментарий: ${comment}` : '';
 
-  // Чистый плоский текст без потенциально опасных спецсимволов и markdown разметки
   const clientText = `Добрый день, ${name}! Ваша заявка принята.\nТовар: ${itemsText}\nТелефон: ${phone}${commentText}`;
   const groupText = `🔔 Новая заявка из МАКС-Магазина!\nКлиент: ${name}\nТелефон: ${phone}\nТовар: ${itemsText}${commentText}`;
 
-  // 1. Отправка клиенту в личный чат с ботом
+  // 1. Отправка клиенту в личку
   if (max_user_id) {
     await sendMaxMessage('user_id', max_user_id, clientText);
   }
 
-  // 2. Отправка менеджерам в общую группу
+  // 2. Отправка менеджерам в группу
   await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, groupText);
 
-  // 3. Отправка админу лично (если заполнено в Render)
+  // 3. Отправка админу (если задан)
   if (process.env.MAX_NOTIFY_USER_ID) {
     await sendMaxMessage('user_id', process.env.MAX_NOTIFY_USER_ID, groupText);
   }
