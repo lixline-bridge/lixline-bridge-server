@@ -1,5 +1,13 @@
 // Мост между сайтом lixcompany.ru (OpenCart) и мини-приложениями в MAX/Telegram.
+
+// ВАЖНО: этот флаг отключает проверку SSL-сертификатов для запросов,
+// которые делает сервер. Он нужен, потому что API MAX использует
+// российский сертификат Минцифры, которого нет в доверенных
+// сертификатах на зарубежных серверах вроде Render. Это рабочий, но не
+// самый безопасный обход — если захотите, потом заменим на добавление
+// самого сертификата в доверенные (надёжнее, но чуть больше работы).
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -14,8 +22,8 @@ const FEED_URL = process.env.FEED_URL;
 const FEED_TOKEN = process.env.FEED_TOKEN;
 const CACHE_TTL = (Number(process.env.CACHE_TTL_SECONDS) || 300) * 1000;
 
-// ID вашей группы в МАКС для менеджеров
-const MANAGERS_GROUP_ID = "-79068581102977";
+// ID вашей группы в MAX для менеджеров — куда присылать уведомления о заявках
+const MANAGERS_GROUP_ID = '-79068581102977';
 
 let cache = { data: null, fetchedAt: 0 };
 
@@ -77,55 +85,36 @@ app.get('/api/products/:id', async (req, res) => {
 });
 
 // Забираем токен и очищаем его от возможных случайных пробелов
-const rawToken = process.env.MAX_BOT_TOKEN || '';
-const MAX_BOT_TOKEN = rawToken.trim();
+const MAX_BOT_TOKEN = (process.env.MAX_BOT_TOKEN || '').trim();
 
-async function sendMaxMessage(targetParam, targetId, textContent) {
+/**
+ * Отправляет сообщение через официальный MAX Bot API.
+ * Документация: https://dev.max.ru/docs-api/methods/POST/messages
+ * Правильный адрес: https://platform-api2.max.ru/messages?user_id=... (или chat_id=...)
+ * Токен передаётся в заголовке Authorization БЕЗ слова "Bearer".
+ */
+async function sendMaxMessage(targetParam, targetId, text) {
   if (!MAX_BOT_TOKEN || !targetId) return;
 
-  const url = `https://max.ru{targetParam}=${encodeURIComponent(targetId)}`;
-
-  // Пробуем стандартный заголовок. Если прокси требует "Bearer ", подставим его.
-  const authHeader = MAX_BOT_TOKEN.startsWith('Bearer ') ? MAX_BOT_TOKEN : `Bearer ${MAX_BOT_TOKEN}`;
+  const url = `https://platform-api2.max.ru/messages?${targetParam}=${encodeURIComponent(targetId)}`;
 
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: {
-        'Authorization': authHeader,
-        'Content-Type': 'application/json'
+        Authorization: MAX_BOT_TOKEN,
+        'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        text: textContent
-      })
+      body: JSON.stringify({ text }),
     });
-    
+
     if (!res.ok) {
-      const errText = await res.text();
-      console.warn(`MAX API ошибка отправки с Bearer (${targetParam}=${targetId}):`, res.status, errText);
-      
-      // Запасной вариант: если с Bearer не вышло, пробуем отправить токен чистым текстом
-      if (res.status === 400 || res.status === 401) {
-        console.log("Пробуем альтернативный формат авторизации без Bearer...");
-        const retryRes = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Authorization': MAX_BOT_TOKEN,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ text: textContent })
-        });
-        if (!retryRes.ok) {
-          console.warn(`Финальная ошибка без Bearer:`, retryRes.status, await retryRes.text());
-        } else {
-          console.log(`Успешно отправлено альтернативным методом в ${targetParam}=${targetId}`);
-        }
-      }
+      console.warn(`MAX API ошибка (${targetParam}=${targetId}):`, res.status, await res.text());
     } else {
-      console.log(`Сообщение успешно ушло в чат ${targetParam}=${targetId}`);
+      console.log(`Сообщение успешно отправлено (${targetParam}=${targetId})`);
     }
   } catch (e) {
-    console.warn(`Исключение при работе с МАКС API:`, e.message);
+    console.warn('Исключение при обращении к MAX API:', e.message);
   }
 }
 
@@ -135,35 +124,55 @@ app.post('/api/order', async (req, res) => {
     return res.status(400).json({ error: 'Укажите имя и телефон' });
   }
 
-  console.log('Обработка новой заявки:', { name, phone, comment, items, max_user_id });
+  console.log('Новая заявка:', {
+    name,
+    phone,
+    comment,
+    items,
+    max_user_id,
+    at: new Date().toISOString(),
+  });
 
   const itemsText = (items || [])
-    .map((i) => `«${i.name}» — ${i.price} руб.`)
+    .map((i) => `«${i.name}» — ${new Intl.NumberFormat('ru-RU').format(i.price)} ₽`)
     .join(', ');
+  const commentText = comment ? `\nВаш комментарий: ${comment}` : '';
 
-  const commentText = comment ? `\nКомментарий: ${comment}` : '';
-
-  const clientText = `Добрый день, ${name}! Ваша заявка принята.\nТовар: ${itemsText}\nТелефон: ${phone}${commentText}`;
-  const groupText = `🔔 Новая заявка из МАКС-Магазина!\nКлиент: ${name}\nТелефон: ${phone}\nТовар: ${itemsText}${commentText}`;
-
+  // Подтверждение клиенту — придёт прямо в его чат с ботом «Ликс-Лайн»
   if (max_user_id) {
-    await sendMaxMessage('user_id', max_user_id, clientText);
+    await sendMaxMessage(
+      'user_id',
+      max_user_id,
+      `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nСкоро свяжемся с вами по номеру ${phone}${commentText}\n\nМожете написать здесь, если хотите что-то уточнить уже сейчас.`
+    );
   }
 
-  await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, groupText);
+  // Уведомление в группу менеджеров
+  if (MANAGERS_GROUP_ID) {
+    await sendMaxMessage(
+      'chat_id',
+      MANAGERS_GROUP_ID,
+      `🔔 Новая заявка!\n${name}, ${phone}\n${itemsText}${commentText}`
+    );
+  }
 
+  // Личное уведомление вам (необязательно, если заполнено в .env)
   if (process.env.MAX_NOTIFY_USER_ID) {
-    await sendMaxMessage('user_id', process.env.MAX_NOTIFY_USER_ID, groupText);
+    await sendMaxMessage(
+      'user_id',
+      process.env.MAX_NOTIFY_USER_ID,
+      `🔔 Новая заявка!\n${name}, ${phone}\n${itemsText}${commentText}`
+    );
   }
 
   res.json({ ok: true });
 });
 
 app.use((err, req, res, next) => {
-  console.error("Глобальная ошибка сервера:", err.stack);
-  res.status(500).json({ error: "Внутренняя ошибка сервера" });
+  console.error('Глобальная ошибка сервера:', err.stack);
+  res.status(500).json({ error: 'Внутренняя ошибка сервера' });
 });
 
 app.listen(PORT, () => {
-  console.log(`Мост Ликс-Лайн успешно запущен на порту: ${PORT}`);
+  console.log(`Мост Ликс-Лайн запущен на порту ${PORT}`);
 });
