@@ -312,7 +312,7 @@ app.post('/api/order', async (req, res) => {
       [
         [
           { type: 'callback', text: 'Да, позвоните', payload: 'call_yes' },
-          { type: 'callback', text: 'Лучше напишите здесь', payload: 'call_no' },
+          { type: 'callback', text: 'Переписка в чате', payload: 'call_no' },
         ],
       ]
     );
