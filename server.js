@@ -125,19 +125,26 @@ async function sendMaxMessage(targetParam, targetId, text, buttons) {
   }
 }
 
-/** Подтверждает нажатие кнопки (убирает "часики" у клиента), см. POST /answers */
-async function answerCallback(callbackId, notification) {
+/** Подтверждает нажатие кнопки: убирает "часики" у клиента и может
+ *  заменить текст/кнопки исходного сообщения — см. POST /answers */
+async function answerCallback(callbackId, { notification, message } = {}) {
   if (!MAX_BOT_TOKEN || !callbackId) return;
   const url = `https://platform-api2.max.ru/answers?callback_id=${encodeURIComponent(callbackId)}`;
+  const body = {};
+  if (notification) body.notification = notification;
+  if (message) body.message = message;
   try {
-    await fetch(url, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: {
         Authorization: MAX_BOT_TOKEN,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ notification }),
+      body: JSON.stringify(body),
     });
+    if (!res.ok) {
+      console.warn('Ошибка answerCallback:', res.status, await res.text());
+    }
   } catch (e) {
     console.warn('Не удалось подтвердить нажатие кнопки:', e.message);
   }
@@ -168,6 +175,10 @@ async function registerWebhook() {
   }
 }
 
+// Чтобы не обработать одно и то же нажатие дважды, если MAX по какой-то
+// причине пришлёт событие повторно
+const processedCallbacks = new Set();
+
 // Приём событий от MAX — сюда прилетают нажатия кнопок
 app.post('/webhook', async (req, res) => {
   const update = req.body || {};
@@ -175,13 +186,30 @@ app.post('/webhook', async (req, res) => {
 
   if (update.update_type === 'message_callback' && update.callback) {
     const { callback_id, payload, user } = update.callback;
+
+    if (processedCallbacks.has(callback_id)) {
+      return res.json({ ok: true });
+    }
+    processedCallbacks.add(callback_id);
+
     const name = (user && (user.name || user.first_name)) || 'Клиент';
 
     let choiceText = 'сделал выбор';
-    if (payload === 'call_yes') choiceText = '✅ согласен на звонок';
-    if (payload === 'call_no') choiceText = '💬 просит написать здесь, в чат с ботом';
+    let clientReplyText = 'Спасибо за ответ!';
+    if (payload === 'call_yes') {
+      choiceText = '✅ согласен на звонок';
+      clientReplyText = '✅ Хорошо, мы позвоним вам по указанному номеру в ближайшее время.';
+    }
+    if (payload === 'call_no') {
+      choiceText = '💬 просит написать здесь, в чат с ботом';
+      clientReplyText = '💬 Хорошо, продолжим здесь — напишите, если хотите что-то уточнить уже сейчас.';
+    }
 
-    await answerCallback(callback_id, 'Спасибо, передали менеджеру!');
+    // меняем исходное сообщение клиенту: кнопки исчезают, появляется
+    // явное подтверждение выбора — это и есть видимый отклик на нажатие
+    await answerCallback(callback_id, {
+      message: { text: clientReplyText, attachments: [] },
+    });
 
     if (MANAGERS_GROUP_ID) {
       await sendMaxMessage(
