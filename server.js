@@ -25,6 +25,10 @@ const CACHE_TTL = (Number(process.env.CACHE_TTL_SECONDS) || 300) * 1000;
 // ID вашей группы в MAX для менеджеров — куда присылать уведомления о заявках
 const MANAGERS_GROUP_ID = '-79068581102977';
 
+// Собственный публичный адрес этого сервера — нужен, чтобы подписаться
+// на события MAX (нажатия кнопок) при запуске
+const OWN_BASE_URL = 'https://lixline-bridge-server.onrender.com';
+
 let cache = { data: null, fetchedAt: 0 };
 
 async function getCatalog() {
@@ -45,11 +49,6 @@ async function getCatalog() {
 }
 
 app.get('/health', (req, res) => res.json({ ok: true }));
-
-app.post('/webhook', (req, res) => {
-  console.log('MAX update:', JSON.stringify(req.body));
-  res.json({ ok: true });
-});
 
 app.get('/api/categories', async (req, res) => {
   try {
@@ -88,15 +87,23 @@ app.get('/api/products/:id', async (req, res) => {
 const MAX_BOT_TOKEN = (process.env.MAX_BOT_TOKEN || '').trim();
 
 /**
- * Отправляет сообщение через официальный MAX Bot API.
+ * Отправляет сообщение через официальный MAX Bot API, опционально с кнопками.
  * Документация: https://dev.max.ru/docs-api/methods/POST/messages
- * Правильный адрес: https://platform-api2.max.ru/messages?user_id=... (или chat_id=...)
- * Токен передаётся в заголовке Authorization БЕЗ слова "Bearer".
  */
-async function sendMaxMessage(targetParam, targetId, text) {
+async function sendMaxMessage(targetParam, targetId, text, buttons) {
   if (!MAX_BOT_TOKEN || !targetId) return;
 
   const url = `https://platform-api2.max.ru/messages?${targetParam}=${encodeURIComponent(targetId)}`;
+
+  const body = { text };
+  if (buttons) {
+    body.attachments = [
+      {
+        type: 'inline_keyboard',
+        payload: { buttons },
+      },
+    ];
+  }
 
   try {
     const res = await fetch(url, {
@@ -105,7 +112,7 @@ async function sendMaxMessage(targetParam, targetId, text) {
         Authorization: MAX_BOT_TOKEN,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(body),
     });
 
     if (!res.ok) {
@@ -117,6 +124,76 @@ async function sendMaxMessage(targetParam, targetId, text) {
     console.warn('Исключение при обращении к MAX API:', e.message);
   }
 }
+
+/** Подтверждает нажатие кнопки (убирает "часики" у клиента), см. POST /answers */
+async function answerCallback(callbackId, notification) {
+  if (!MAX_BOT_TOKEN || !callbackId) return;
+  const url = `https://platform-api2.max.ru/answers?callback_id=${encodeURIComponent(callbackId)}`;
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: MAX_BOT_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ notification }),
+    });
+  } catch (e) {
+    console.warn('Не удалось подтвердить нажатие кнопки:', e.message);
+  }
+}
+
+/** Регистрирует наш /webhook как получателя событий MAX (нажатия кнопок и т.д.) */
+async function registerWebhook() {
+  if (!MAX_BOT_TOKEN) return;
+  try {
+    const res = await fetch('https://platform-api2.max.ru/subscriptions', {
+      method: 'POST',
+      headers: {
+        Authorization: MAX_BOT_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        url: `${OWN_BASE_URL}/webhook`,
+        update_types: ['message_callback'],
+      }),
+    });
+    if (res.ok) {
+      console.log('Подписка на события MAX оформлена:', `${OWN_BASE_URL}/webhook`);
+    } else {
+      console.warn('Не удалось оформить подписку на события MAX:', res.status, await res.text());
+    }
+  } catch (e) {
+    console.warn('Исключение при подписке на события MAX:', e.message);
+  }
+}
+
+// Приём событий от MAX — сюда прилетают нажатия кнопок
+app.post('/webhook', async (req, res) => {
+  const update = req.body || {};
+  console.log('MAX update:', JSON.stringify(update));
+
+  if (update.update_type === 'message_callback' && update.callback) {
+    const { callback_id, payload, user } = update.callback;
+    const name = (user && (user.name || user.first_name)) || 'Клиент';
+
+    let choiceText = 'сделал выбор';
+    if (payload === 'call_yes') choiceText = '✅ согласен на звонок';
+    if (payload === 'call_no') choiceText = '💬 просит написать здесь, в чат с ботом';
+
+    await answerCallback(callback_id, 'Спасибо, передали менеджеру!');
+
+    if (MANAGERS_GROUP_ID) {
+      await sendMaxMessage(
+        'chat_id',
+        MANAGERS_GROUP_ID,
+        `👉 ${name} (ID ${user ? user.user_id : '—'}) ${choiceText}`
+      );
+    }
+  }
+
+  res.json({ ok: true });
+});
 
 app.post('/api/order', async (req, res) => {
   const { name, phone, comment, items, max_user_id } = req.body || {};
@@ -138,12 +215,19 @@ app.post('/api/order', async (req, res) => {
     .join(', ');
   const commentText = comment ? `\nВаш комментарий: ${comment}` : '';
 
-  // Подтверждение клиенту — придёт прямо в его чат с ботом «Ликс-Лайн»
+  // Подтверждение клиенту — придёт прямо в его чат с ботом «Ликс-Лайн»,
+  // с кнопками "звоните" / "лучше напишите"
   if (max_user_id) {
     await sendMaxMessage(
       'user_id',
       max_user_id,
-      `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nСкоро свяжемся с вами по номеру ${phone}${commentText}\n\nМожете написать здесь, если хотите что-то уточнить уже сейчас.`
+      `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nВаш номер телефона: ${phone}${commentText}\n\nКак вам удобнее — позвонить или продолжить здесь, в переписке?`,
+      [
+        [
+          { type: 'callback', text: 'Да, позвоните', payload: 'call_yes' },
+          { type: 'callback', text: 'Лучше напишите здесь', payload: 'call_no' },
+        ],
+      ]
     );
   }
 
@@ -175,4 +259,5 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`Мост Ликс-Лайн запущен на порту ${PORT}`);
+  registerWebhook();
 });
