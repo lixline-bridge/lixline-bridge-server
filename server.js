@@ -162,7 +162,7 @@ async function registerWebhook() {
       },
       body: JSON.stringify({
         url: `${OWN_BASE_URL}/webhook`,
-        update_types: ['message_callback'],
+        update_types: ['message_callback', 'message_created'],
       }),
     });
     if (res.ok) {
@@ -187,6 +187,27 @@ const pendingOrderText = new Map();
 app.post('/webhook', async (req, res) => {
   const update = req.body || {};
   console.log('MAX update:', JSON.stringify(update));
+
+  // Обычное текстовое сообщение от клиента (не нажатие кнопки) —
+  // пересылаем его в группу менеджеров, чтобы никто не потерялся
+  if (update.update_type === 'message_created' && update.message) {
+    const sender = update.message.sender;
+    const text = update.message.body && update.message.body.text;
+
+    // не реагируем на сообщения самого бота (иначе будет эхо по кругу)
+    if (sender && !sender.is_bot) {
+      const name = sender.name || sender.first_name || 'Клиент';
+      const bodyText = text || '(вложение без текста)';
+
+      if (MANAGERS_GROUP_ID) {
+        await sendMaxMessage(
+          'chat_id',
+          MANAGERS_GROUP_ID,
+          `✉️ ${name} (ID ${sender.user_id}) написал(а):\n${bodyText}`
+        );
+      }
+    }
+  }
 
   if (update.update_type === 'message_callback' && update.callback) {
     const { callback_id, payload, user } = update.callback;
@@ -248,6 +269,13 @@ app.post('/api/reply', async (req, res) => {
     return res.status(400).json({ error: 'Укажите ID клиента и текст сообщения' });
   }
   await sendMaxMessage('user_id', user_id, text);
+
+  // сохраняем копию в группе менеджеров — так у вас остаётся история,
+  // что именно и кому вы отвечали
+  if (MANAGERS_GROUP_ID) {
+    await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, `📤 Вы ответили (ID ${user_id}):\n${text}`);
+  }
+
   res.json({ ok: true });
 });
 
