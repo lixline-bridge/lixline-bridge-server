@@ -179,6 +179,10 @@ async function registerWebhook() {
 // причине пришлёт событие повторно
 const processedCallbacks = new Set();
 
+// Храним текст последнего сообщения о заказе для каждого клиента, чтобы
+// при нажатии кнопки дописать к нему подтверждение, а не стереть заказ
+const pendingOrderText = new Map();
+
 // Приём событий от MAX — сюда прилетают нажатия кнопок
 app.post('/webhook', async (req, res) => {
   const update = req.body || {};
@@ -195,20 +199,27 @@ app.post('/webhook', async (req, res) => {
     const name = (user && (user.name || user.first_name)) || 'Клиент';
 
     let choiceText = 'сделал выбор';
-    let clientReplyText = 'Спасибо за ответ!';
+    let confirmLine = 'Спасибо за ответ!';
     if (payload === 'call_yes') {
       choiceText = '✅ согласен на звонок';
-      clientReplyText = '✅ Хорошо, мы позвоним вам по указанному номеру в ближайшее время.';
+      confirmLine = '✅ Хорошо, мы позвоним вам по указанному номеру в ближайшее время.';
     }
     if (payload === 'call_no') {
       choiceText = '💬 просит написать здесь, в чат с ботом';
-      clientReplyText = '💬 Хорошо, продолжим здесь — напишите, если хотите что-то уточнить уже сейчас.';
+      confirmLine = '💬 Хорошо, продолжим здесь — напишите, если хотите что-то уточнить уже сейчас.';
     }
+
+    // Дописываем подтверждение к исходному тексту заказа, а не стираем его —
+    // у клиента должна остаться видна вся история, что именно он заказал
+    const userId = user ? user.user_id : null;
+    const originalOrderText = userId ? pendingOrderText.get(userId) : null;
+    const updatedText = originalOrderText ? `${originalOrderText}\n\n${confirmLine}` : confirmLine;
+    if (userId) pendingOrderText.delete(userId);
 
     // меняем исходное сообщение клиенту: кнопки исчезают, появляется
     // явное подтверждение выбора — это и есть видимый отклик на нажатие
     await answerCallback(callback_id, {
-      message: { text: clientReplyText, attachments: [] },
+      message: { text: updatedText, attachments: [] },
     });
 
     if (MANAGERS_GROUP_ID) {
@@ -246,10 +257,13 @@ app.post('/api/order', async (req, res) => {
   // Подтверждение клиенту — придёт прямо в его чат с ботом «Ликс-Лайн»,
   // с кнопками "звоните" / "лучше напишите"
   if (max_user_id) {
+    const orderText = `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nВаш номер телефона: ${phone}${commentText}`;
+    pendingOrderText.set(max_user_id, orderText);
+
     await sendMaxMessage(
       'user_id',
       max_user_id,
-      `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nВаш номер телефона: ${phone}${commentText}\n\nКак вам удобнее — позвонить или продолжить здесь, в переписке?`,
+      `${orderText}\n\nКак вам удобнее — позвонить или продолжить здесь, в переписке?`,
       [
         [
           { type: 'callback', text: 'Да, позвоните', payload: 'call_yes' },
