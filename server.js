@@ -234,6 +234,23 @@ app.post('/webhook', async (req, res) => {
   res.json({ ok: true });
 });
 
+// Пароль для "пульта" — простой веб-страницы, с которой можно вручную
+// написать конкретному клиенту. Впишите свой пароль в переменную
+// окружения ADMIN_SECRET в Render.
+const ADMIN_SECRET = (process.env.ADMIN_SECRET || '').trim();
+
+app.post('/api/reply', async (req, res) => {
+  const { secret, user_id, text } = req.body || {};
+  if (!ADMIN_SECRET || secret !== ADMIN_SECRET) {
+    return res.status(403).json({ error: 'Неверный пароль' });
+  }
+  if (!user_id || !text) {
+    return res.status(400).json({ error: 'Укажите ID клиента и текст сообщения' });
+  }
+  await sendMaxMessage('user_id', user_id, text);
+  res.json({ ok: true });
+});
+
 app.post('/api/order', async (req, res) => {
   const { name, phone, comment, items, max_user_id } = req.body || {};
   if (!name || !phone) {
@@ -278,7 +295,7 @@ app.post('/api/order', async (req, res) => {
     await sendMaxMessage(
       'chat_id',
       MANAGERS_GROUP_ID,
-      `🔔 Новая заявка!\n${name}, ${phone}\n${itemsText}${commentText}`
+      `🔔 Новая заявка! (ID ${max_user_id || '—'})\n${name}, ${phone}\n${itemsText}${commentText}`
     );
   }
 
@@ -287,7 +304,7 @@ app.post('/api/order', async (req, res) => {
     await sendMaxMessage(
       'user_id',
       process.env.MAX_NOTIFY_USER_ID,
-      `🔔 Новая заявка!\n${name}, ${phone}\n${itemsText}${commentText}`
+      `🔔 Новая заявка! (ID ${max_user_id || '—'})\n${name}, ${phone}\n${itemsText}${commentText}`
     );
   }
 
