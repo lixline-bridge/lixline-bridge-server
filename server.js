@@ -85,6 +85,86 @@ app.get('/api/products/:id', async (req, res) => {
 
 // Забираем токен и очищаем его от возможных случайных пробелов
 const MAX_BOT_TOKEN = (process.env.MAX_BOT_TOKEN || '').trim();
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+
+/**
+ * Отправляет сообщение через Telegram Bot API, опционально с кнопками.
+ * Документация: https://core.telegram.org/bots/api#sendmessage
+ */
+async function sendTelegramMessage(chatId, text, buttons) {
+  if (!TELEGRAM_BOT_TOKEN || !chatId) return;
+
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const body = { chat_id: chatId, text };
+  if (buttons) {
+    body.reply_markup = {
+      inline_keyboard: buttons.map((row) =>
+        row.map((b) => ({ text: b.text, callback_data: b.payload }))
+      ),
+    };
+  }
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      console.warn(`Telegram API ошибка (chat_id=${chatId}):`, res.status, await res.text());
+    } else {
+      console.log(`Сообщение в Telegram успешно отправлено (chat_id=${chatId})`);
+    }
+  } catch (e) {
+    console.warn('Исключение при обращении к Telegram API:', e.message);
+  }
+}
+
+/** Подтверждает нажатие кнопки в Telegram и меняет текст/убирает кнопки исходного сообщения */
+async function answerTelegramCallback(callbackQueryId, notification) {
+  if (!TELEGRAM_BOT_TOKEN || !callbackQueryId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text: notification }),
+    });
+  } catch (e) {
+    console.warn('Не удалось подтвердить нажатие кнопки в Telegram:', e.message);
+  }
+}
+
+async function editTelegramMessage(chatId, messageId, text) {
+  if (!TELEGRAM_BOT_TOKEN || !chatId || !messageId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: [] } }),
+    });
+  } catch (e) {
+    console.warn('Не удалось изменить сообщение в Telegram:', e.message);
+  }
+}
+
+/** Регистрирует наш /webhook/telegram как получателя событий Telegram */
+async function registerTelegramWebhook() {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: `${OWN_BASE_URL}/webhook/telegram` }),
+    });
+    if (res.ok) {
+      console.log('Подписка на события Telegram оформлена:', `${OWN_BASE_URL}/webhook/telegram`);
+    } else {
+      console.warn('Не удалось оформить подписку на события Telegram:', res.status, await res.text());
+    }
+  } catch (e) {
+    console.warn('Исключение при подписке на события Telegram:', e.message);
+  }
+}
 
 /**
  * Отправляет сообщение через официальный MAX Bot API, опционально с кнопками.
@@ -223,7 +303,7 @@ app.post('/webhook', async (req, res) => {
     let confirmLine = 'Спасибо за ответ!';
     if (payload === 'call_yes') {
       choiceText = '✅ согласен на звонок';
-      confirmLine = '✅ Хорошо, мы позвоним вам по указанному номеру в ближайшее рабочее время. Мы работаем с 9:00 до 18:00 в стандартные рабочие дни. Если вы ожидаете звонок в определенное время - напишите пожалуйста, когда нам лучше позвонить вам';
+      confirmLine = '✅ Хорошо, мы позвоним вам по указанному номеру в ближайшее рабочее время. Мы работаем с 9:00 до 18:00 в стандартные рабочие дни. Если вы ожидаете звонок определенное время - напишите пожалуйста, когда нам лучше позвонить вам';
     }
     if (payload === 'call_no') {
       choiceText = '💬 просит написать здесь, в чат с ботом';
@@ -233,9 +313,10 @@ app.post('/webhook', async (req, res) => {
     // Дописываем подтверждение к исходному тексту заказа, а не стираем его —
     // у клиента должна остаться видна вся история, что именно он заказал
     const userId = user ? user.user_id : null;
-    const originalOrderText = userId ? pendingOrderText.get(userId) : null;
+    const storeKey = userId ? `max:${userId}` : null;
+    const originalOrderText = storeKey ? pendingOrderText.get(storeKey) : null;
     const updatedText = originalOrderText ? `${originalOrderText}\n\n${confirmLine}` : confirmLine;
-    if (userId) pendingOrderText.delete(userId);
+    if (storeKey) pendingOrderText.delete(storeKey);
 
     // меняем исходное сообщение клиенту: кнопки исчезают, появляется
     // явное подтверждение выбора — это и есть видимый отклик на нажатие
@@ -255,42 +336,126 @@ app.post('/webhook', async (req, res) => {
   res.json({ ok: true });
 });
 
+// Приём событий от Telegram — сюда прилетают и обычные сообщения, и нажатия кнопок
+app.post('/webhook/telegram', async (req, res) => {
+  const update = req.body || {};
+  console.log('Telegram update:', JSON.stringify(update));
+
+  // Нажатие кнопки
+  if (update.callback_query) {
+    const cb = update.callback_query;
+    const callbackId = cb.id;
+
+    if (processedCallbacks.has(callbackId)) {
+      return res.json({ ok: true });
+    }
+    processedCallbacks.add(callbackId);
+
+    const payload = cb.data;
+    const from = cb.from || {};
+    const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || 'Клиент';
+    const chatId = cb.message && cb.message.chat && cb.message.chat.id;
+    const messageId = cb.message && cb.message.message_id;
+
+    let choiceText = 'сделал выбор';
+    let confirmLine = 'Спасибо за ответ!';
+    if (payload === 'call_yes') {
+      choiceText = '✅ согласен на звонок';
+      confirmLine = '✅ Хорошо, мы позвоним вам по указанному номеру в ближайшее рабочее время. Мы работаем с 9:00 до 18:00 в стандартные рабочие дни. Если вы ожидаете звонок определённое время — напишите, пожалуйста, когда нам лучше позвонить вам';
+    }
+    if (payload === 'call_no') {
+      choiceText = '💬 просит написать здесь, в чат с ботом';
+      confirmLine = '💬 Хорошо, продолжим здесь — напишите, если хотите что-то уточнить уже сейчас.';
+    }
+
+    const storeKey = chatId ? `telegram:${chatId}` : null;
+    const originalOrderText = storeKey ? pendingOrderText.get(storeKey) : null;
+    const updatedText = originalOrderText ? `${originalOrderText}\n\n${confirmLine}` : confirmLine;
+    if (storeKey) pendingOrderText.delete(storeKey);
+
+    await answerTelegramCallback(callbackId, 'Спасибо!');
+    if (chatId && messageId) {
+      await editTelegramMessage(chatId, messageId, updatedText);
+    }
+
+    if (MANAGERS_GROUP_ID) {
+      await sendMaxMessage(
+        'chat_id',
+        MANAGERS_GROUP_ID,
+        `👉 [Telegram] ${name} (ID ${chatId || '—'}) ${choiceText}`
+      );
+    }
+
+    return res.json({ ok: true });
+  }
+
+  // Обычное текстовое сообщение
+  if (update.message && update.message.text && !update.message.from.is_bot) {
+    const from = update.message.from;
+    const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || 'Клиент';
+    const chatId = update.message.chat.id;
+    const text = update.message.text;
+
+    if (MANAGERS_GROUP_ID) {
+      await sendMaxMessage(
+        'chat_id',
+        MANAGERS_GROUP_ID,
+        `✉️ [Telegram] ${name} (ID ${chatId}) написал(а):\n${text}`
+      );
+    }
+  }
+
+  res.json({ ok: true });
+});
+
 // Пароль для "пульта" — простой веб-страницы, с которой можно вручную
 // написать конкретному клиенту. Впишите свой пароль в переменную
 // окружения ADMIN_SECRET в Render.
 const ADMIN_SECRET = (process.env.ADMIN_SECRET || '').trim();
 
 app.post('/api/reply', async (req, res) => {
-  const { secret, user_id, text } = req.body || {};
+  const { secret, user_id, text, platform } = req.body || {};
   if (!ADMIN_SECRET || secret !== ADMIN_SECRET) {
     return res.status(403).json({ error: 'Неверный пароль' });
   }
   if (!user_id || !text) {
     return res.status(400).json({ error: 'Укажите ID клиента и текст сообщения' });
   }
-  await sendMaxMessage('user_id', user_id, text);
+
+  if (platform === 'telegram') {
+    await sendTelegramMessage(user_id, text);
+  } else {
+    await sendMaxMessage('user_id', user_id, text);
+  }
 
   // сохраняем копию в группе менеджеров — так у вас остаётся история,
   // что именно и кому вы отвечали
+  const platformTag = platform === 'telegram' ? '[Telegram] ' : '';
   if (MANAGERS_GROUP_ID) {
-    await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, `📤 Вы ответили (ID ${user_id}):\n${text}`);
+    await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, `📤 ${platformTag}Вы ответили (ID ${user_id}):\n${text}`);
   }
 
   res.json({ ok: true });
 });
 
 app.post('/api/order', async (req, res) => {
-  const { name, phone, comment, items, max_user_id } = req.body || {};
+  const { name, phone, comment, items, platform, platform_user_id, max_user_id } = req.body || {};
   if (!name || !phone) {
     return res.status(400).json({ error: 'Укажите имя и телефон' });
   }
+
+  // platform/platform_user_id — новый универсальный вид заявки из витрины.
+  // max_user_id оставлен для совместимости со старой версией файла.
+  const effectivePlatform = platform || (max_user_id ? 'max' : null);
+  const effectiveUserId = platform_user_id || max_user_id || null;
 
   console.log('Новая заявка:', {
     name,
     phone,
     comment,
     items,
-    max_user_id,
+    platform: effectivePlatform,
+    userId: effectiveUserId,
     at: new Date().toISOString(),
   });
 
@@ -299,31 +464,36 @@ app.post('/api/order', async (req, res) => {
     .join(', ');
   const commentText = comment ? `\nВаш комментарий: ${comment}` : '';
 
-  // Подтверждение клиенту — придёт прямо в его чат с ботом «Ликс-Лайн»,
-  // с кнопками "звоните" / "лучше напишите"
-  if (max_user_id) {
-    const orderText = `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nВаш номер телефона: ${phone}${commentText}`;
-    pendingOrderText.set(max_user_id, orderText);
+  const buttons = [
+    [
+      { type: 'callback', text: 'Да, позвоните', payload: 'call_yes' },
+      { type: 'callback', text: 'Переписка в чате', payload: 'call_no' },
+    ],
+  ];
 
-    await sendMaxMessage(
-      'user_id',
-      max_user_id,
-      `${orderText}\n\nКак вам удобнее — позвонить или продолжить здесь, в переписке?`,
-      [
-        [
-          { type: 'callback', text: 'Да, позвоните', payload: 'call_yes' },
-          { type: 'callback', text: 'Переписка в чате', payload: 'call_no' },
-        ],
-      ]
-    );
+  // Подтверждение клиенту — придёт прямо в его чат с ботом,
+  // с кнопками "звоните" / "переписка в чате"
+  if (effectiveUserId) {
+    const orderText = `Добрый день, ${name}! Мы получили вашу заявку по товару ${itemsText}.\nВаш номер телефона: ${phone}${commentText}`;
+    const askLine = '\n\nКак вам удобнее — позвонить или продолжить здесь, в переписке?';
+
+    if (effectivePlatform === 'telegram') {
+      pendingOrderText.set(`telegram:${effectiveUserId}`, orderText);
+      await sendTelegramMessage(effectiveUserId, orderText + askLine, buttons);
+    } else {
+      pendingOrderText.set(`max:${effectiveUserId}`, orderText);
+      await sendMaxMessage('user_id', effectiveUserId, orderText + askLine, buttons);
+    }
   }
 
-  // Уведомление в группу менеджеров
+  const platformTag = effectivePlatform === 'telegram' ? '[Telegram] ' : '';
+
+  // Уведомление в группу менеджеров (всегда в MAX — это ваш единый пункт управления)
   if (MANAGERS_GROUP_ID) {
     await sendMaxMessage(
       'chat_id',
       MANAGERS_GROUP_ID,
-      `🔔 Новая заявка! (ID ${max_user_id || '—'})\n${name}, ${phone}\n${itemsText}${commentText}`
+      `🔔 ${platformTag}Новая заявка! (ID ${effectiveUserId || '—'})\n${name}, ${phone}\n${itemsText}${commentText}`
     );
   }
 
@@ -332,7 +502,7 @@ app.post('/api/order', async (req, res) => {
     await sendMaxMessage(
       'user_id',
       process.env.MAX_NOTIFY_USER_ID,
-      `🔔 Новая заявка! (ID ${max_user_id || '—'})\n${name}, ${phone}\n${itemsText}${commentText}`
+      `🔔 ${platformTag}Новая заявка! (ID ${effectiveUserId || '—'})\n${name}, ${phone}\n${itemsText}${commentText}`
     );
   }
 
@@ -347,4 +517,5 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`Мост Ликс-Лайн запущен на порту ${PORT}`);
   registerWebhook();
+  registerTelegramWebhook();
 });
