@@ -199,6 +199,177 @@ async function notifyManagers(platform, text) {
   }
 }
 
+/* =========================================================================
+   Темы в Telegram-группе менеджеров: у каждого клиента своя тема
+   («Имя · телефон»), где вся его переписка. Список «клиент → тема»
+   хранится на сайте (lixline-topics.php), потому что бесплатный Render
+   забывает всё при перезапуске.
+   ========================================================================= */
+const TOPICS_URL = (process.env.TOPICS_URL || (FEED_URL ? FEED_URL.replace(/[^\/]*$/, 'lixline-topics.php') : '')).trim();
+const topicByClient = new Map();   // ID клиента -> { thread, name, phone }
+const clientByThread = new Map();  // ID темы -> ID клиента
+const topicCreating = new Map();   // ID клиента -> идёт создание темы
+let topicsLoaded = false;
+
+/** Универсальный вызов Telegram Bot API */
+async function tgApi(method, body) {
+  if (!TELEGRAM_BOT_TOKEN) return { ok: false, description: 'TELEGRAM_BOT_TOKEN не задан' };
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      console.error(`Telegram ${method} ошибка:`, res.status, JSON.stringify(data));
+      return { ok: false, description: data.description || `HTTP ${res.status}` };
+    }
+    return { ok: true, result: data.result };
+  } catch (e) {
+    console.error(`Исключение Telegram ${method}:`, e.message);
+    return { ok: false, description: e.message };
+  }
+}
+
+async function loadTopics() {
+  if (topicsLoaded) return;
+  if (!TOPICS_URL || !FEED_TOKEN) {
+    console.warn('Хранилище тем не настроено (нет FEED_URL/FEED_TOKEN) — темы не переживут перезапуск сервера');
+    topicsLoaded = true;
+    return;
+  }
+  try {
+    const res = await fetch(`${TOPICS_URL}?action=get&token=${encodeURIComponent(FEED_TOKEN)}`);
+    if (!res.ok) throw new Error(`статус ${res.status}`);
+    const data = await res.json();
+    for (const [id, t] of Object.entries(data.clients || {})) {
+      topicByClient.set(String(id), t);
+      clientByThread.set(Number(t.thread), String(id));
+    }
+    topicsLoaded = true;
+    console.log(`Темы клиентов загружены: ${topicByClient.size}`);
+  } catch (e) {
+    console.warn('Не удалось загрузить темы клиентов (проверьте lixline-topics.php на сайте):', e.message);
+  }
+}
+
+async function saveTopic(clientId, rec) {
+  if (!TOPICS_URL || !FEED_TOKEN) return;
+  try {
+    const res = await fetch(`${TOPICS_URL}?action=set&token=${encodeURIComponent(FEED_TOKEN)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: clientId, thread: rec.thread, name: rec.name, phone: rec.phone || '' }),
+    });
+    if (!res.ok) console.warn('Не удалось сохранить тему клиента на сайте, статус', res.status);
+  } catch (e) {
+    console.warn('Не удалось сохранить тему клиента на сайте:', e.message);
+  }
+}
+
+function topicTitle(name, phone, clientId) {
+  return `${name || 'Клиент'} · ${phone || 'ID ' + clientId}`.slice(0, 128);
+}
+
+function topicLink(thread) {
+  return `https://t.me/c/${String(TELEGRAM_MANAGERS_GROUP_ID).replace(/^-100/, '')}/${thread}`;
+}
+
+/** Возвращает ID темы клиента, при необходимости создаёт её (или дописывает телефон в название) */
+async function ensureTopic(clientId, name, phone) {
+  if (!TELEGRAM_MANAGERS_GROUP_ID || !clientId) return null;
+  clientId = String(clientId);
+  await loadTopics();
+
+  let rec = topicByClient.get(clientId);
+  if (rec) {
+    if (phone && !rec.phone) {
+      const newRec = { thread: rec.thread, name: rec.name || name || 'Клиент', phone };
+      await tgApi('editForumTopic', {
+        chat_id: TELEGRAM_MANAGERS_GROUP_ID,
+        message_thread_id: rec.thread,
+        name: topicTitle(newRec.name, phone, clientId),
+      });
+      topicByClient.set(clientId, newRec);
+      await saveTopic(clientId, newRec);
+    }
+    return Number(rec.thread);
+  }
+
+  if (topicCreating.has(clientId)) return topicCreating.get(clientId);
+
+  const creating = (async () => {
+    const r = await tgApi('createForumTopic', {
+      chat_id: TELEGRAM_MANAGERS_GROUP_ID,
+      name: topicTitle(name, phone, clientId),
+    });
+    if (!r.ok) {
+      console.error('Не удалось создать тему клиента — проверьте, что в группе включены «Темы» и у бота есть право «Управление темами»:', r.description);
+      return null;
+    }
+    const thread = r.result.message_thread_id;
+    const newRec = { thread, name: name || 'Клиент', phone: phone || '' };
+    topicByClient.set(clientId, newRec);
+    clientByThread.set(Number(thread), clientId);
+    await saveTopic(clientId, newRec);
+    return thread;
+  })();
+  topicCreating.set(clientId, creating);
+  try {
+    return await creating;
+  } finally {
+    topicCreating.delete(clientId);
+  }
+}
+
+/**
+ * Пишет сообщение в тему клиента (создаёт тему, если её ещё нет).
+ * Если темы недоступны — отправляет в общую ленту группы, как раньше.
+ * announceText — короткое уведомление в общую ленту со ссылкой на тему
+ * (используем для новых заявок). Возвращает ID темы или null.
+ */
+async function notifyTelegramClient(clientId, name, phone, text, announceText) {
+  const thread = await ensureTopic(clientId, name, phone);
+  if (!thread) {
+    await notifyManagers('telegram', text);
+    return null;
+  }
+
+  const send = (threadId) =>
+    tgApi('sendMessage', { chat_id: TELEGRAM_MANAGERS_GROUP_ID, message_thread_id: threadId, text });
+
+  let r = await send(thread);
+
+  // тему закрыли вручную — открываем и пишем снова
+  if (!r.ok && /TOPIC_CLOSED/i.test(r.description || '')) {
+    await tgApi('reopenForumTopic', { chat_id: TELEGRAM_MANAGERS_GROUP_ID, message_thread_id: thread });
+    r = await send(thread);
+  }
+
+  // тему удалили вручную — забываем старую и создаём новую
+  if (!r.ok && /thread not found/i.test(r.description || '')) {
+    const old = topicByClient.get(String(clientId));
+    topicByClient.delete(String(clientId));
+    if (old) clientByThread.delete(Number(old.thread));
+    const thread2 = await ensureTopic(clientId, name || (old && old.name), phone || (old && old.phone));
+    if (!thread2) {
+      await notifyManagers('telegram', text);
+      return null;
+    }
+    r = await send(thread2);
+    if (r.ok && announceText) {
+      await sendTelegramMessage(TELEGRAM_MANAGERS_GROUP_ID, `${announceText}\nПереписка: ${topicLink(thread2)}`);
+    }
+    return thread2;
+  }
+
+  if (r.ok && announceText) {
+    await sendTelegramMessage(TELEGRAM_MANAGERS_GROUP_ID, `${announceText}\nПереписка: ${topicLink(thread)}`);
+  }
+  return thread;
+}
+
 /**
  * Отправляет сообщение через официальный MAX Bot API, опционально с кнопками.
  * Документация: https://dev.max.ru/docs-api/methods/POST/messages
@@ -401,7 +572,12 @@ app.post('/webhook/telegram', async (req, res) => {
       await editTelegramMessage(chatId, messageId, updatedText);
     }
 
-    await notifyManagers('telegram', `👉 ${name} (ID ${chatId || '—'}) ${choiceText}`);
+    const choiceMsg = `👉 ${name} (ID ${chatId || '—'}) ${choiceText}`;
+    if (chatId) {
+      await notifyTelegramClient(chatId, name, null, choiceMsg);
+    } else {
+      await notifyManagers('telegram', choiceMsg);
+    }
 
     return res.json({ ok: true });
   }
@@ -418,6 +594,33 @@ app.post('/webhook/telegram', async (req, res) => {
     // чат с ботом. Всё остальное в группе игнорируем: это общение менеджеров
     // между собой, бот его никуда не пересылает и не повторяет.
     if (TELEGRAM_MANAGERS_GROUP_ID && String(chatId) === TELEGRAM_MANAGERS_GROUP_ID) {
+      // Написали в теме клиента — отправляем клиенту. Сообщения, которые
+      // начинаются с «//», считаются внутренней заметкой и клиенту не уходят.
+      await loadTopics();
+      const threadId = msg.message_thread_id;
+      const topicClientId = threadId ? clientByThread.get(Number(threadId)) : null;
+      if (topicClientId) {
+        if (text.startsWith('//')) return res.json({ ok: true });
+        const sentToClient = await sendTelegramMessage(topicClientId, text);
+        if (sentToClient) {
+          // 👍 под сообщением менеджера = клиент получил
+          await tgApi('setMessageReaction', {
+            chat_id: chatId,
+            message_id: msg.message_id,
+            reaction: [{ type: 'emoji', emoji: '👍' }],
+          });
+        } else {
+          await tgApi('sendMessage', {
+            chat_id: chatId,
+            message_thread_id: threadId,
+            reply_to_message_id: msg.message_id,
+            text: '⚠️ Не удалось доставить клиенту: возможно, он не разрешил боту писать или заблокировал бота',
+          });
+        }
+        return res.json({ ok: true });
+      }
+
+      // Запасной способ (не в теме клиента): «Ответить» на сообщение бота с «(ID …)»
       const repliedText = (msg.reply_to_message && (msg.reply_to_message.text || msg.reply_to_message.caption)) || '';
       const idMatch = repliedText.match(/\(ID (\d+)\)/);
       if (idMatch) {
@@ -436,7 +639,7 @@ app.post('/webhook/telegram', async (req, res) => {
     // Сообщения клиентов принимаем только из личного чата с ботом
     if (msg.chat.type === 'private') {
       const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || 'Клиент';
-      await notifyManagers('telegram', `✉️ ${name} (ID ${chatId}) написал(а):\n${text}`);
+      await notifyTelegramClient(chatId, name, null, `✉️ ${name} (ID ${chatId}) написал(а):\n${text}`);
     }
   }
 
@@ -465,7 +668,12 @@ app.post('/api/reply', async (req, res) => {
 
   // сохраняем копию в группе менеджеров — так у вас остаётся история,
   // что именно и кому вы отвечали
-  await notifyManagers(platform, `📤 Вы ответили (ID ${user_id}):\n${text}`);
+  const replyCopy = `📤 Вы ответили (ID ${user_id}):\n${text}`;
+  if (platform === 'telegram') {
+    await notifyTelegramClient(user_id, null, null, replyCopy);
+  } else {
+    await notifyManagers(platform, replyCopy);
+  }
 
   res.json({ ok: true });
 });
@@ -531,10 +739,18 @@ app.post('/api/order', async (req, res) => {
 
   // Уведомление в группу менеджеров — в MAX или в Telegram,
   // в зависимости от того, откуда пришла заявка
-  await notifyManagers(
-    effectivePlatform,
-    `🔔 Новая заявка! ${idNote}\n${name}, ${phone}\n${itemsText}${commentText}`
-  );
+  const leadText = `🔔 Новая заявка! ${idNote}\n${name}, ${phone}\n${itemsText}${commentText}`;
+  if (effectivePlatform === 'telegram' && effectiveUserId) {
+    await notifyTelegramClient(
+      effectiveUserId,
+      name,
+      phone,
+      leadText,
+      `🔔 Новая заявка: ${name}, ${phone} — ${itemsText}`
+    );
+  } else {
+    await notifyManagers(effectivePlatform, leadText);
+  }
 
   // Личное уведомление вам (необязательно, если заполнено в .env)
   if (process.env.MAX_NOTIFY_USER_ID) {
@@ -557,4 +773,5 @@ app.listen(PORT, () => {
   console.log(`Мост Ликс-Лайн запущен на порту ${PORT}`);
   registerWebhook();
   registerTelegramWebhook();
+  loadTopics();
 });
