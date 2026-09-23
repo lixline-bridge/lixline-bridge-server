@@ -99,11 +99,11 @@ const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 async function sendTelegramMessage(chatId, text, buttons) {
   if (!TELEGRAM_BOT_TOKEN) {
     console.error('TELEGRAM_BOT_TOKEN не задан в Render — сообщение в Telegram не отправлено');
-    return;
+    return false;
   }
   if (!chatId) {
     console.error('Telegram: не передан ID получателя — сообщение не отправлено');
-    return;
+    return false;
   }
 
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -128,8 +128,10 @@ async function sendTelegramMessage(chatId, text, buttons) {
     } else {
       console.log(`Сообщение в Telegram успешно отправлено (chat_id=${chatId})`);
     }
+    return res.ok;
   } catch (e) {
     console.error('Исключение при обращении к Telegram API:', e.message);
+    return false;
   }
 }
 
@@ -405,13 +407,37 @@ app.post('/webhook/telegram', async (req, res) => {
   }
 
   // Обычное текстовое сообщение
-  if (update.message && update.message.text && !update.message.from.is_bot) {
-    const from = update.message.from;
-    const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || 'Клиент';
-    const chatId = update.message.chat.id;
-    const text = update.message.text;
+  if (update.message && update.message.text && update.message.from && !update.message.from.is_bot) {
+    const msg = update.message;
+    const from = msg.from;
+    const chatId = msg.chat.id;
+    const text = msg.text;
 
-    await notifyManagers('telegram', `✉️ ${name} (ID ${chatId}) написал(а):\n${text}`);
+    // Сообщение в группе менеджеров. Если это «Ответить» на сообщение бота
+    // о клиенте (в нём есть «(ID 123456)») — пересылаем ответ клиенту в его
+    // чат с ботом. Всё остальное в группе игнорируем: это общение менеджеров
+    // между собой, бот его никуда не пересылает и не повторяет.
+    if (TELEGRAM_MANAGERS_GROUP_ID && String(chatId) === TELEGRAM_MANAGERS_GROUP_ID) {
+      const repliedText = (msg.reply_to_message && (msg.reply_to_message.text || msg.reply_to_message.caption)) || '';
+      const idMatch = repliedText.match(/\(ID (\d+)\)/);
+      if (idMatch) {
+        const clientId = idMatch[1];
+        const sent = await sendTelegramMessage(clientId, text);
+        await sendTelegramMessage(
+          TELEGRAM_MANAGERS_GROUP_ID,
+          sent
+            ? `✅ Доставлено клиенту (ID ${clientId})`
+            : `⚠️ Не удалось доставить клиенту (ID ${clientId}): возможно, он не разрешил боту писать или заблокировал бота`
+        );
+      }
+      return res.json({ ok: true });
+    }
+
+    // Сообщения клиентов принимаем только из личного чата с ботом
+    if (msg.chat.type === 'private') {
+      const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || 'Клиент';
+      await notifyManagers('telegram', `✉️ ${name} (ID ${chatId}) написал(а):\n${text}`);
+    }
   }
 
   res.json({ ok: true });
