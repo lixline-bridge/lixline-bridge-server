@@ -25,6 +25,11 @@ const CACHE_TTL = (Number(process.env.CACHE_TTL_SECONDS) || 300) * 1000;
 // ID вашей группы в MAX для менеджеров — куда присылать уведомления о заявках
 const MANAGERS_GROUP_ID = '-79068581102977';
 
+// ID группы в Telegram для менеджеров — заявки из Telegram пойдут сюда,
+// а не в группу MAX. Заполните в Render переменную TELEGRAM_MANAGERS_GROUP_ID,
+// как только создадите такую группу (см. инструкцию).
+const TELEGRAM_MANAGERS_GROUP_ID = (process.env.TELEGRAM_MANAGERS_GROUP_ID || '').trim();
+
 // Собственный публичный адрес этого сервера — нужен, чтобы подписаться
 // на события MAX (нажатия кнопок) при запуске
 const OWN_BASE_URL = 'https://lixline-bridge-server.onrender.com';
@@ -92,7 +97,14 @@ const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
  * Документация: https://core.telegram.org/bots/api#sendmessage
  */
 async function sendTelegramMessage(chatId, text, buttons) {
-  if (!TELEGRAM_BOT_TOKEN || !chatId) return;
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.error('TELEGRAM_BOT_TOKEN не задан в Render — сообщение в Telegram не отправлено');
+    return;
+  }
+  if (!chatId) {
+    console.error('Telegram: не передан ID получателя — сообщение не отправлено');
+    return;
+  }
 
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   const body = { chat_id: chatId, text };
@@ -110,13 +122,14 @@ async function sendTelegramMessage(chatId, text, buttons) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
+    const responseText = await res.text();
     if (!res.ok) {
-      console.warn(`Telegram API ошибка (chat_id=${chatId}):`, res.status, await res.text());
+      console.error(`Telegram API ошибка (chat_id=${chatId}):`, res.status, responseText);
     } else {
       console.log(`Сообщение в Telegram успешно отправлено (chat_id=${chatId})`);
     }
   } catch (e) {
-    console.warn('Исключение при обращении к Telegram API:', e.message);
+    console.error('Исключение при обращении к Telegram API:', e.message);
   }
 }
 
@@ -163,6 +176,24 @@ async function registerTelegramWebhook() {
     }
   } catch (e) {
     console.warn('Исключение при подписке на события Telegram:', e.message);
+  }
+}
+
+/**
+ * Отправляет уведомление в нужную группу менеджеров: заявки/сообщения
+ * из Telegram — в Telegram-группу, из MAX — в MAX-группу. Если Telegram-
+ * группа ещё не настроена (нет TELEGRAM_MANAGERS_GROUP_ID) — временно
+ * дублирует в MAX-группу, чтобы уведомление не потерялось совсем.
+ */
+async function notifyManagers(platform, text) {
+  if (platform === 'telegram') {
+    if (TELEGRAM_MANAGERS_GROUP_ID) {
+      await sendTelegramMessage(TELEGRAM_MANAGERS_GROUP_ID, text);
+    } else if (MANAGERS_GROUP_ID) {
+      await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, `[Telegram-группа не настроена] ${text}`);
+    }
+  } else if (MANAGERS_GROUP_ID) {
+    await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, text);
   }
 }
 
@@ -280,11 +311,7 @@ app.post('/webhook', async (req, res) => {
       const bodyText = text || '(вложение без текста)';
 
       if (MANAGERS_GROUP_ID) {
-        await sendMaxMessage(
-          'chat_id',
-          MANAGERS_GROUP_ID,
-          `✉️ ${name} (ID ${sender.user_id}) написал(а):\n${bodyText}`
-        );
+        await notifyManagers('max', `✉️ ${name} (ID ${sender.user_id}) написал(а):\n${bodyText}`);
       }
     }
   }
@@ -324,13 +351,7 @@ app.post('/webhook', async (req, res) => {
       message: { text: updatedText, attachments: [] },
     });
 
-    if (MANAGERS_GROUP_ID) {
-      await sendMaxMessage(
-        'chat_id',
-        MANAGERS_GROUP_ID,
-        `👉 ${name} (ID ${user ? user.user_id : '—'}) ${choiceText}`
-      );
-    }
+    await notifyManagers('max', `👉 ${name} (ID ${user ? user.user_id : '—'}) ${choiceText}`);
   }
 
   res.json({ ok: true });
@@ -378,13 +399,7 @@ app.post('/webhook/telegram', async (req, res) => {
       await editTelegramMessage(chatId, messageId, updatedText);
     }
 
-    if (MANAGERS_GROUP_ID) {
-      await sendMaxMessage(
-        'chat_id',
-        MANAGERS_GROUP_ID,
-        `👉 [Telegram] ${name} (ID ${chatId || '—'}) ${choiceText}`
-      );
-    }
+    await notifyManagers('telegram', `👉 ${name} (ID ${chatId || '—'}) ${choiceText}`);
 
     return res.json({ ok: true });
   }
@@ -396,13 +411,7 @@ app.post('/webhook/telegram', async (req, res) => {
     const chatId = update.message.chat.id;
     const text = update.message.text;
 
-    if (MANAGERS_GROUP_ID) {
-      await sendMaxMessage(
-        'chat_id',
-        MANAGERS_GROUP_ID,
-        `✉️ [Telegram] ${name} (ID ${chatId}) написал(а):\n${text}`
-      );
-    }
+    await notifyManagers('telegram', `✉️ ${name} (ID ${chatId}) написал(а):\n${text}`);
   }
 
   res.json({ ok: true });
@@ -430,10 +439,7 @@ app.post('/api/reply', async (req, res) => {
 
   // сохраняем копию в группе менеджеров — так у вас остаётся история,
   // что именно и кому вы отвечали
-  const platformTag = platform === 'telegram' ? '[Telegram] ' : '';
-  if (MANAGERS_GROUP_ID) {
-    await sendMaxMessage('chat_id', MANAGERS_GROUP_ID, `📤 ${platformTag}Вы ответили (ID ${user_id}):\n${text}`);
-  }
+  await notifyManagers(platform, `📤 Вы ответили (ID ${user_id}):\n${text}`);
 
   res.json({ ok: true });
 });
@@ -443,6 +449,11 @@ app.post('/api/order', async (req, res) => {
   if (!name || !phone) {
     return res.status(400).json({ error: 'Укажите имя и телефон' });
   }
+
+  // ВРЕМЕННО: подробный лог того, что реально прислала витрина —
+  // уберём, как только разберёмся с недостающим ID у Telegram
+  console.log('========== СЫРОЕ ТЕЛО ЗАЯВКИ ==========');
+  console.log(JSON.stringify(req.body, null, 2));
 
   // platform/platform_user_id — новый универсальный вид заявки из витрины.
   // max_user_id оставлен для совместимости со старой версией файла.
@@ -456,6 +467,8 @@ app.post('/api/order', async (req, res) => {
     items,
     platform: effectivePlatform,
     userId: effectiveUserId,
+    hasTelegramToken: !!TELEGRAM_BOT_TOKEN,
+    hasMaxToken: !!MAX_BOT_TOKEN,
     at: new Date().toISOString(),
   });
 
@@ -484,25 +497,25 @@ app.post('/api/order', async (req, res) => {
       pendingOrderText.set(`max:${effectiveUserId}`, orderText);
       await sendMaxMessage('user_id', effectiveUserId, orderText + askLine, buttons);
     }
+  } else {
+    console.warn('ID клиента не определился — подтверждение клиенту не отправлено');
   }
 
-  const platformTag = effectivePlatform === 'telegram' ? '[Telegram] ' : '';
+  const idNote = effectiveUserId ? `(ID ${effectiveUserId})` : '(ID не определился — отвечайте только звонком)';
 
-  // Уведомление в группу менеджеров (всегда в MAX — это ваш единый пункт управления)
-  if (MANAGERS_GROUP_ID) {
-    await sendMaxMessage(
-      'chat_id',
-      MANAGERS_GROUP_ID,
-      `🔔 ${platformTag}Новая заявка! (ID ${effectiveUserId || '—'})\n${name}, ${phone}\n${itemsText}${commentText}`
-    );
-  }
+  // Уведомление в группу менеджеров — в MAX или в Telegram,
+  // в зависимости от того, откуда пришла заявка
+  await notifyManagers(
+    effectivePlatform,
+    `🔔 Новая заявка! ${idNote}\n${name}, ${phone}\n${itemsText}${commentText}`
+  );
 
   // Личное уведомление вам (необязательно, если заполнено в .env)
   if (process.env.MAX_NOTIFY_USER_ID) {
     await sendMaxMessage(
       'user_id',
       process.env.MAX_NOTIFY_USER_ID,
-      `🔔 ${platformTag}Новая заявка! (ID ${effectiveUserId || '—'})\n${name}, ${phone}\n${itemsText}${commentText}`
+      `🔔 Новая заявка! ${idNote}\n${name}, ${phone}\n${itemsText}${commentText}`
     );
   }
 
